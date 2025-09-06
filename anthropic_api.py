@@ -22,6 +22,7 @@ from type_definitions import (
 from services import ChatService
 from content_processor import ContentProcessor
 from multimodal_processor import MultimodalProcessor
+from tool_call_handler import ToolCallHandler
 from utils import Logger, ResponseHelper, IDGenerator
 from config import config
 
@@ -43,6 +44,7 @@ class AnthropicAPIHandler:
         self.chat_service = chat_service
         self.content_processor = content_processor
         self.multimodal_processor = MultimodalProcessor(Logger("multimodal"))
+        self.tool_call_handler = ToolCallHandler()
         self.logger = Logger("anthropic_api")
     
     def handle_messages(self) -> Response:
@@ -180,6 +182,33 @@ class AnthropicAPIHandler:
             }
         }
         
+        # 处理工具调用
+        if "tools" in anthropic_request:
+            # 转换 Anthropic 工具格式为内部格式
+            tools = []
+            for tool in anthropic_request["tools"]:
+                if tool.get("type") == "function":
+                    input_schema = tool.get("input_schema", {})
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name"),
+                            "description": tool.get("description", ""),
+                            "parameters": input_schema
+                        }
+                    })
+            upstream_request["tools"] = tools
+            
+            if "tool_choice" in anthropic_request:
+                tool_choice = anthropic_request["tool_choice"]
+                if isinstance(tool_choice, dict):
+                    upstream_request["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": tool_choice.get("name")}
+                    }
+                else:
+                    upstream_request["tool_choice"] = tool_choice
+        
         return upstream_request
     
     def _handle_streaming(self, upstream_request: UpstreamRequest, 
@@ -234,13 +263,19 @@ class AnthropicAPIHandler:
                         # chunk 是 SSE 格式: "data: {json}"
                         if chunk.startswith("data: "):
                             data_str = chunk[6:]  # 移除 "data: " 前缀
-                            if data_str == "[DONE]":
+                            if data_str.strip() == "[DONE]":
                                 break
+                            
+                            # 跳过空数据或只包含换行符的数据
+                            if not data_str.strip():
+                                continue
                             
                             data = json.loads(data_str)
                             
                             # 从标准 OpenAI 格式中提取内容
                             delta_content = ""
+                            tool_calls = []
+                            
                             if "choices" in data and data["choices"]:
                                 choice = data["choices"][0]
                                 if "delta" in choice:
@@ -248,6 +283,11 @@ class AnthropicAPIHandler:
                                     # 内容可能在 content 或 role 字段中
                                     if "content" in delta:
                                         delta_content = delta["content"]
+                                    elif "tool_calls" in delta:
+                                        # 处理工具调用
+                                        for tool_call in delta["tool_calls"]:
+                                            if "function" in tool_call:
+                                                tool_calls.append(tool_call)
                                     elif "role" in delta and delta["role"] == "assistant":
                                         # 跳过角色消息
                                         continue
@@ -272,6 +312,20 @@ class AnthropicAPIHandler:
                                         }
                                     }
                                     yield f"event: {content_delta['type']}\ndata: {json.dumps(content_delta)}\n\n"
+                            
+                            # 处理工具调用
+                            if tool_calls:
+                                for i, tool_call in enumerate(tool_calls):
+                                    # 发送工具调用事件
+                                    tool_call_delta: AnthropicContentBlockDeltaEvent = {
+                                        "type": "content_block_delta",
+                                        "index": i + 1,  # 从1开始，因为0已经被文本内容占用
+                                        "delta": {
+                                            "type": "tool_call_delta",
+                                            "tool_call": tool_call
+                                        }
+                                    }
+                                    yield f"event: {tool_call_delta['type']}\ndata: {json.dumps(tool_call_delta)}\n\n"
                     
                     except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
                         continue
@@ -343,6 +397,7 @@ class AnthropicAPIHandler:
             
             # 收集所有内容
             full_content = ""
+            tool_calls = []
             chunk_count = 0
             empty_chunks = 0
             generator = result["generator"]
@@ -361,9 +416,13 @@ class AnthropicAPIHandler:
                         continue
                     
                     data_str = chunk[6:]  # 移除 "data: " 前缀
-                    if data_str == "[DONE]":
+                    if data_str.strip() == "[DONE]":
                         self.logger.debug(f"Stream completed after {chunk_count} chunks")
                         break
+                    
+                    # 跳过空数据或只包含换行符的数据
+                    if not data_str.strip() or data_str.strip() == "[DONE]":
+                        continue
                     
                     try:
                         data = json.loads(data_str)
@@ -382,6 +441,11 @@ class AnthropicAPIHandler:
                             # 内容可能在 content 或 role 字段中
                             if "content" in delta:
                                 delta_content = delta["content"]
+                            elif "tool_calls" in delta:
+                                # 处理工具调用
+                                for tool_call in delta["tool_calls"]:
+                                    if "function" in tool_call:
+                                        tool_calls.append(tool_call)
                             elif "role" in delta and delta["role"] == "assistant":
                                 # 跳过角色消息
                                 self.logger.debug(f"Chunk {chunk_count}: Skipping role message")
@@ -445,18 +509,42 @@ class AnthropicAPIHandler:
                 })
             
             # 构建响应
+            response_content = []
+            if full_content:
+                response_content.append({"type": "text", "text": full_content})
+            
+            # 确保stop_reason正确设置
+            stop_reason = "end_turn"
+            if tool_calls:
+                stop_reason = "tool_use"
+            elif not full_content:
+                stop_reason = "error"
+            
             response: AnthropicResponse = {
                 "id": f"msg_{uuid.uuid4().hex}",
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "text", "text": full_content}],
+                "content": response_content,
                 "model": anthropic_request["model"],
-                "stop_reason": "end_turn",
+                "stop_reason": stop_reason,
                 "usage": {
                     "input_tokens": len(str(anthropic_request.get("messages", []))) // 4,
                     "output_tokens": len(full_content) // 4
                 }
             }
+            
+            # 如果有工具调用，添加到响应中
+            if tool_calls:
+                # 在Anthropic API中，工具调用作为单独的内容块处理
+                for tool_call in tool_calls:
+                    # 生成唯一的工具调用ID以确保符合API规范
+                    tool_use_id = f"toolu_{uuid.uuid4().hex[:12]}"
+                    response["content"].append({
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": tool_call.get("function", {}).get("name", ""),
+                        "input": json.loads(tool_call.get("function", {}).get("arguments", "{}"))
+                    })
             
             return jsonify(response)
             

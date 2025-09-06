@@ -21,6 +21,10 @@ class PerformanceMetrics:
     total_response_time: float = 0.0
     average_response_time: float = 0.0
     error_count: int = 0
+    tool_call_count: int = 0
+    tool_call_success_count: int = 0
+    tool_call_total_tokens: int = 0
+    tool_call_average_tokens: float = 0.0
     
     def update_response_time(self, response_time: float) -> None:
         """更新响应时间统计"""
@@ -40,11 +44,24 @@ class PerformanceMetrics:
         """增加错误次数"""
         self.error_count += 1
     
+    def increment_tool_calls(self, tokens: int = 0) -> None:
+        """增加工具调用次数"""
+        self.tool_call_count += 1
+        if tokens > 0:
+            self.tool_call_success_count += 1
+            self.tool_call_total_tokens += tokens
+            self.tool_call_average_tokens = self.tool_call_total_tokens / self.tool_call_success_count
+    
     @property
     def cache_hit_rate(self) -> float:
         """缓存命中率"""
         total = self.cache_hits + self.cache_misses
         return self.cache_hits / total if total > 0 else 0.0
+    
+    @property
+    def tool_call_success_rate(self) -> float:
+        """工具调用成功率"""
+        return self.tool_call_success_count / self.tool_call_count if self.tool_call_count > 0 else 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""
@@ -54,7 +71,10 @@ class PerformanceMetrics:
             "cache_misses": self.cache_misses,
             "cache_hit_rate": self.cache_hit_rate,
             "average_response_time": self.average_response_time,
-            "error_count": self.error_count
+            "error_count": self.error_count,
+            "tool_call_count": self.tool_call_count,
+            "tool_call_success_rate": self.tool_call_success_rate,
+            "tool_call_average_tokens": self.tool_call_average_tokens
         }
 
 

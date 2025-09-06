@@ -7,6 +7,7 @@
 import json
 import time
 import re
+import uuid
 from datetime import datetime
 from typing import Dict, Any, Iterator, Optional, List
 from http_client import ZAIClient, HttpClientError
@@ -16,6 +17,8 @@ from utils import Logger, IDGenerator, ModelFormatter
 from config import config
 from cache import get_cache
 from performance import get_monitor, RequestTimer
+from tool_call_manager import ToolCallManager
+from tool_call_error_handler import ToolCallErrorHandler, ToolCallParseError
 
 
 class ChatService:
@@ -31,6 +34,8 @@ class ChatService:
         self.logger = logger
         self.multimodal_processor = MultimodalProcessor(logger)
         self.cache = get_cache()
+        self.tool_call_manager = ToolCallManager()
+        self.tool_call_error_handler = ToolCallErrorHandler()
         self._models_cache_ttl = 300  # 5分钟缓存模型列表
         self._auth_token_cache_ttl = 600  # 10分钟缓存认证令牌
     
@@ -122,6 +127,9 @@ class ChatService:
                 
             is_stream = request_data.get("stream", False)
             
+            # 检查是否包含工具调用
+            has_tools = bool(request_data.get("tools"))
+            
             # 处理多模态消息
             original_messages = request_data.get("messages", [])
             
@@ -186,6 +194,18 @@ class ChatService:
                 timer.success = False
                 self.logger.error("聊天完成处理失败: %s, 请求ID: %s, 模型: %s", e, chat_id, model)
                 raise Exception(f"内部处理错误: {e} (请求ID: {chat_id})")
+            finally:
+                # 如果有工具调用，记录统计
+                if has_tools and hasattr(self, 'tool_call_manager'):
+                    monitor = get_monitor()
+                    tool_call_count = len(self.tool_call_manager.active_calls)
+                    if tool_call_count > 0:
+                        # 获取工具调用的平均 token 使用量
+                        total_tokens = sum(
+                            call.get("usage", {}).get("total_tokens", 0) 
+                            for call in self.tool_call_manager.active_calls.values()
+                        )
+                        monitor.metrics.increment_tool_calls(total_tokens // tool_call_count if tool_call_count > 0 else 0)
     
     def _handle_stream_response(self, upstream: Iterator[bytes], model: str) -> Dict[str, Any]:
         """处理流式响应
@@ -201,9 +221,9 @@ class ChatService:
             chat_id = IDGenerator.generate_id('chatcmpl')
             content_index = 0
             has_thinking = False
-            has_tool_call = False
-            tool_args = ""
-            tool_id = ""
+            
+            # 重置工具调用管理器
+            self.tool_call_manager.reset_state()
             
             # 发送开始消息
             start_data = {
@@ -221,11 +241,18 @@ class ChatService:
                 # 检查是否完成
                 if chunk_data.get("done"):
                     # 发送结束消息
+                    # 优先从上游响应获取实际的完成原因
+                    finish_reason = chunk_data.get("finish_reason")
+                    if self.tool_call_manager.has_active_calls() and not finish_reason:
+                        finish_reason = "tool_calls"
+                    elif not finish_reason:
+                        finish_reason = "stop"
+                    
                     finish_data = {
                         'id': chat_id,
                         'object': 'chat.completion.chunk',
                         'model': model,
-                        'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
+                        'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}],
                         'usage': chunk_data.get("usage", {
                             "prompt_tokens": 0,
                             "completion_tokens": 0,
@@ -267,21 +294,40 @@ class ChatService:
                 
                 # 处理工具调用
                 elif phase == "tool_call":
-                    has_tool_call = True
                     edit_content = chunk_data.get("edit_content", "")
                     if edit_content and "<glm_block >" in edit_content:
                         blocks = edit_content.split("<glm_block >")
-                        for block in blocks:
+                        for block_idx, block in enumerate(blocks):
                             if "</glm_block>" in block:
                                 try:
                                     # 解析工具调用信息
                                     block_content = block[:-12]  # 移除 </glm_block>
-                                    tool_data = json.loads(block_content)
+                                    
+                                    # 使用错误处理器安全解析
+                                    tool_data = self.tool_call_error_handler.safe_parse_tool_call(
+                                        block_content, 
+                                        {"chat_id": chat_id, "model": model}
+                                    )
+                                    
+                                    if not tool_data:
+                                        # 解析失败，跳过这个块
+                                        continue
+                                        
+                                    # 验证工具调用数据
+                                    if not self.tool_call_error_handler.validate_tool_call(tool_data):
+                                        self.logger.warning(f"无效的工具调用数据: {tool_data}")
+                                        continue
                                     
                                     if tool_data.get("type") == "tool_call":
                                         metadata = tool_data.get("data", {}).get("metadata", {})
                                         if metadata.get("id") and metadata.get("name"):
-                                            tool_id = metadata["id"]
+                                            # 生成唯一的工具调用ID以确保符合API规范
+                                            tool_id = f"call_{uuid.uuid4().hex[:12]}"
+                                            
+                                            # 使用工具调用管理器开始工具调用
+                                            tool_call = self.tool_call_manager.start_tool_call(
+                                                tool_id, metadata["name"], block_idx
+                                            )
                                             
                                             # 发送工具调用开始
                                             tool_start = {
@@ -289,31 +335,105 @@ class ChatService:
                                                 'object': 'chat.completion.chunk',
                                                 'model': model,
                                                 'choices': [{
-                                                    'index': content_index,
+                                                    'index': 0,  # 使用固定索引
                                                     'delta': {
                                                         'role': 'assistant',
                                                         'content': None,
-                                                        'tool_calls': [{
-                                                            'id': tool_id,
-                                                            'type': 'function',
-                                                            'function': {
-                                                                'name': metadata["name"],
-                                                                'arguments': ""
-                                                            }
-                                                        }]
+                                                        'tool_calls': [tool_call]
                                                     }
                                                 }]
                                             }
                                             yield f"data: {json.dumps(tool_start, ensure_ascii=False)}\n\n"
-                                            content_index += 1
                                             
-                                            # 收集参数
+                                            # 收集参数并分块发送
                                             tool_args = json.dumps(metadata.get("arguments", {}))
-                                except (json.JSONDecodeError, KeyError):
-                                    continue
+                                            if tool_args:
+                                                chunk_size = 100
+                                                for i in range(0, len(tool_args), chunk_size):
+                                                    chunk = tool_args[i:i+chunk_size]
+                                                    
+                                                    # 使用工具调用管理器追加参数
+                                                    arg_deltas = self.tool_call_manager.append_arguments(tool_id, chunk)
+                                                    
+                                                    if arg_deltas:
+                                                        for arg_delta in arg_deltas:
+                                                            tool_args_data = {
+                                                                'id': chat_id,
+                                                                'object': 'chat.completion.chunk',
+                                                                'model': model,
+                                                                'choices': [{
+                                                                    'index': 0,
+                                                                    'delta': {
+                                                                        'role': 'assistant',
+                                                                        'content': None,
+                                                                        'tool_calls': [arg_delta]
+                                                                    }
+                                                                }]
+                                                            }
+                                                            yield f"data: {json.dumps(tool_args_data, ensure_ascii=False)}\n\n"
+                                except ToolCallParseError as e:
+                                    # 处理解析错误
+                                    for error_event in self.tool_call_error_handler.handle_parse_error(
+                                        e, {"chat_id": chat_id, "model": model}
+                                    ):
+                                        yield error_event
+                                except Exception as e:
+                                    # 处理其他错误
+                                    for error_event in self.tool_call_error_handler.handle_unknown_error(
+                                        e, {"chat_id": chat_id, "model": model}
+                                    ):
+                                        yield error_event
+                
+                # 处理工具调用结束和其他阶段
+                elif phase == "other":
+                    if self.tool_call_manager.has_active_calls():
+                        # 处理工具调用结束
+                        edit_content = chunk_data.get("edit_content", "")
+                        if edit_content and edit_content.startswith("null,"):
+                            # 获取工具调用使用情况
+                            tool_call_usage = chunk_data.get("usage")
+                            
+                            # 完成所有活跃的工具调用
+                            for tool_id in list(self.tool_call_manager.active_calls.keys()):
+                                if not self.tool_call_manager.active_calls[tool_id]["completed"]:
+                                    # 完成工具调用
+                                    complete_delta = self.tool_call_manager.complete_tool_call(tool_id, tool_call_usage)
+                                    
+                                    if complete_delta:
+                                        # 发送工具调用完成事件
+                                        finish_res = {
+                                            'id': chat_id,
+                                            'object': 'chat.completion.chunk',
+                                            'model': model,
+                                            'choices': [{
+                                                'index': 0,
+                                                'delta': {
+                                                    'role': 'assistant',
+                                                    'content': None,
+                                                    'tool_calls': [complete_delta]
+                                                },
+                                                'finish_reason': 'tool_calls'
+                                            }]
+                                        }
+                                        
+                                        # 添加使用情况信息
+                                        if tool_call_usage:
+                                            finish_res['usage'] = tool_call_usage
+                                        
+                                        yield f"data: {json.dumps(finish_res, ensure_ascii=False)}\n\n"
+                            
+                            # 发送流结束标记
+                            yield "data: [DONE]\n\n"
+                            
+                            # 结束流处理
+                            return
                 
                 # 处理回答内容
-                elif phase == "answer" and not has_tool_call:
+                elif phase == "answer":
+                    # 如果有活跃的工具调用，跳过处理
+                    if self.tool_call_manager.has_active_calls():
+                        continue
+                        
                     # 处理思考链结束
                     if has_thinking and chunk_data.get("edit_content", "").startswith("</details>"):
                         # 发送思考链签名

@@ -445,6 +445,9 @@ class ZAIClient:
         # 添加工具调用
         if tool_calls:
             message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop"
         
         # 构建响应格式
         result = {
@@ -454,7 +457,7 @@ class ZAIClient:
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": "tool_calls" if tool_calls else "stop"
+                "finish_reason": finish_reason
             }],
             "usage": usage or {
                 "prompt_tokens": 0,
