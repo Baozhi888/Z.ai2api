@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  zai2api:
+    build: .
+    container_name: zai2api
+    restart: unless-stopped
+    ports:
+      - "${ZAI_PORT:-8089}:${ZAI_PORT:-8089}"
+    environment:
+      # ===== 基础配置 =====
+      - ZAI_API_BASE=${ZAI_API_BASE:-https://chat.z.ai}
+      - ZAI_PORT=${ZAI_PORT:-8089}
+      - ZAI_DEBUG_MODE=${ZAI_DEBUG_MODE:-false}
+      
+      # ===== 认证配置 =====
+      - ZAI_UPSTREAM_TOKEN=${ZAI_UPSTREAM_TOKEN}
+      - ZAI_ANON_TOKEN_ENABLED=${ZAI_ANON_TOKEN_ENABLED:-true}
+      
+      # ===== 访问密钥配置 =====
+      - ZAI_API_KEY=${ZAI_API_KEY}
+      - ZAI_API_KEY_ENABLED=${ZAI_API_KEY_ENABLED:-true}
+      
+      # ===== 模型配置 =====
+      - ZAI_MODEL_NAME=${ZAI_MODEL_NAME:-glm-4.5v}
+      - ZAI_THINK_TAGS_MODE=${ZAI_THINK_TAGS_MODE:-think}
+      
+      # ===== 性能配置 =====
+      - ZAI_MODELS_CACHE_TTL=${ZAI_MODELS_CACHE_TTL:-300}
+      - ZAI_AUTH_TOKEN_CACHE_TTL=${ZAI_AUTH_TOKEN_CACHE_TTL:-600}
+      - ZAI_CONTENT_CACHE_TTL=${ZAI_CONTENT_CACHE_TTL:-3600}
+      
+      # ===== 缓存配置 =====
+      - ZAI_CACHE_DEFAULT_TTL=${ZAI_CACHE_DEFAULT_TTL:-300}
+      - ZAI_CACHE_MAX_SIZE=${ZAI_CACHE_MAX_SIZE:-1000}
+      
+      # ===== 日志配置 =====
+      - ZAI_LOG_LEVEL=${ZAI_LOG_LEVEL:-INFO}
+      
+      # ===== 安全配置 =====
+      - ZAI_CORS_ORIGINS=${ZAI_CORS_ORIGINS:-*}
+      - ZAI_REQUEST_TIMEOUT=${ZAI_REQUEST_TIMEOUT:-60}
+      - ZAI_STREAM_TIMEOUT=${ZAI_STREAM_TIMEOUT:-120}
+      
+      # ===== 高级配置 =====
+      - ZAI_ENABLE_PERFORMANCE_MONITORING=${ZAI_ENABLE_PERFORMANCE_MONITORING:-true}
+      - ZAI_ENABLE_REQUEST_TRACING=${ZAI_ENABLE_REQUEST_TRACING:-true}
+      - ZAI_MAX_CONCURRENT_REQUESTS=${ZAI_MAX_CONCURRENT_REQUESTS:-100}
+    
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${ZAI_PORT:-8089}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - zai2api-network
+
+  # 可选：使用 Nginx 作为反向代理
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: zai2api-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - zai2api
+  #   networks:
+  #     - zai2api-network
+  #   profiles:
+  #     - nginx
+
+networks:
+  zai2api-network:
+    driver: bridge
+
+volumes:
+  logs:

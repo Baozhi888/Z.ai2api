@@ -1,0 +1,242 @@
+{
+  "scan_timestamp": "2025-09-02T00:00:00Z",
+  "project_name": "Z.ai2api",
+  "project_type": "python-flask",
+  "scan_coverage": {
+    "total_files": 17,
+    "scanned_files": 13,
+    "ignored_files": 4,
+    "coverage_percentage": 76.5
+  },
+  "modules": [
+    {
+      "name": "app",
+      "file": "app.py",
+      "type": "flask_application",
+      "responsibility": "Flask应用入口、路由处理、依赖注入",
+      "interfaces": [
+        "/v1/models (GET, OPTIONS)",
+        "/v1/chat/completions (POST, OPTIONS)",
+        "/metrics (GET)",
+        "/metrics/reset (POST)",
+        "/cache/stats (GET)",
+        "/cache/clear (POST)"
+      ],
+      "dependencies": [
+        "config",
+        "http_client",
+        "content_processor",
+        "services",
+        "utils",
+        "performance",
+        "cache"
+      ],
+      "entry_point": true,
+      "documentation": "app.CLAUDE.md"
+    },
+    {
+      "name": "services",
+      "file": "services.py",
+      "type": "business_logic",
+      "responsibility": "聊天服务、业务逻辑处理、模型管理",
+      "interfaces": [
+        "get_models_list()",
+        "create_chat_completion()"
+      ],
+      "dependencies": [
+        "http_client",
+        "content_processor",
+        "utils",
+        "config",
+        "cache",
+        "performance"
+      ],
+      "entry_point": false,
+      "documentation": "services.CLAUDE.md"
+    },
+    {
+      "name": "content_processor",
+      "file": "content_processor.py",
+      "type": "content_processing",
+      "responsibility": "思考链处理、内容格式转换",
+      "interfaces": [
+        "process_content()"
+      ],
+      "dependencies": [
+        "cache"
+      ],
+      "entry_point": false,
+      "documentation": "content_processor.CLAUDE.md"
+    },
+    {
+      "name": "http_client",
+      "file": "http_client.py",
+      "type": "http_client",
+      "responsibility": "HTTP请求处理、API通信",
+      "interfaces": [
+        "get()",
+        "post_stream()",
+        "get_auth_token()",
+        "get_models()",
+        "create_chat_completion()"
+      ],
+      "dependencies": [
+        "config",
+        "cache"
+      ],
+      "entry_point": false,
+      "documentation": "http_client.CLAUDE.md"
+    },
+    {
+      "name": "config",
+      "file": "config.py",
+      "type": "configuration",
+      "responsibility": "配置管理、环境变量处理",
+      "interfaces": [
+        "AppConfig class",
+        "from_env() method"
+      ],
+      "dependencies": [],
+      "entry_point": false,
+      "documentation": null
+    },
+    {
+      "name": "utils",
+      "file": "utils.py",
+      "type": "utilities",
+      "responsibility": "工具函数、日志记录、响应处理",
+      "interfaces": [
+        "Logger class",
+        "IDGenerator class",
+        "ModelFormatter class",
+        "ResponseHelper class"
+      ],
+      "dependencies": [
+        "config"
+      ],
+      "entry_point": false,
+      "documentation": null
+    },
+    {
+      "name": "exceptions",
+      "file": "exceptions.py",
+      "type": "error_handling",
+      "responsibility": "异常定义、错误处理",
+      "interfaces": [
+        "ErrorCode enum",
+        "ZAIException class",
+        "ErrorHandler class"
+      ],
+      "dependencies": [],
+      "entry_point": false,
+      "documentation": null
+    },
+    {
+      "name": "type_definitions",
+      "file": "type_definitions.py",
+      "type": "type_definitions",
+      "responsibility": "类型定义、数据结构",
+      "interfaces": [
+        "ThinkTagsMode enum",
+        "各种 TypedDict 类型定义"
+      ],
+      "dependencies": [],
+      "entry_point": false,
+      "documentation": null
+    },
+    {
+      "name": "cache",
+      "file": "cache.py",
+      "type": "caching",
+      "responsibility": "缓存机制、内存管理",
+      "interfaces": [
+        "Cache class",
+        "cache_result decorator",
+        "get_cache() function"
+      ],
+      "dependencies": [],
+      "entry_point": false,
+      "documentation": null
+    },
+    {
+      "name": "performance",
+      "file": "performance.py",
+      "type": "monitoring",
+      "responsibility": "性能监控、统计信息",
+      "interfaces": [
+        "PerformanceMonitor class",
+        "RequestTimer class",
+        "get_monitor() function"
+      ],
+      "dependencies": [],
+      "entry_point": false,
+      "documentation": null
+    }
+  ],
+  "ignored_files": [
+    {
+      "file": "__pycache__/",
+      "reason": "Python编译文件目录"
+    },
+    {
+      "file": "app_old.py",
+      "reason": "旧版本文件，不再使用"
+    },
+    {
+      "file": "requirements.txt",
+      "reason": "依赖文件，非代码文件"
+    },
+    {
+      "file": "README.md",
+      "reason": "文档文件，已读取内容"
+    }
+  ],
+  "scan_gaps": [
+    {
+      "area": "测试覆盖",
+      "description": "项目缺少测试目录和测试文件",
+      "recommendation": "建议创建 tests/ 目录并添加单元测试"
+    },
+    {
+      "area": "部署配置",
+      "description": "缺少部署相关的配置文件",
+      "recommendation": "建议添加 Dockerfile、docker-compose.yml 等部署配置"
+    },
+    {
+      "area": "API文档",
+      "description": "缺少详细的API文档",
+      "recommendation": "建议添加 OpenAPI/Swagger 文档"
+    }
+  ],
+  "next_steps": [
+    "为 config.py 模块创建详细文档",
+    "为 utils.py 模块创建详细文档",
+    "为 cache.py 模块创建详细文档",
+    "为 performance.py 模块创建详细文档",
+    "创建测试目录和测试文件",
+    "添加部署配置文件",
+    "生成 OpenAPI 文档"
+  ],
+  "architecture_summary": {
+    "pattern": "模块化单体架构",
+    "layers": [
+      "应用层 (app.py)",
+      "业务逻辑层 (services.py, content_processor.py)",
+      "基础设施层 (http_client.py, config.py, cache.py, performance.py, utils.py, exceptions.py, type_definitions.py)"
+    ],
+    "design_principles": [
+      "单一职责原则",
+      "依赖倒置原则",
+      "开闭原则",
+      "接口隔离原则"
+    ],
+    "key_features": [
+      "OpenAI API 兼容",
+      "思考链处理",
+      "流式响应",
+      "缓存机制",
+      "性能监控",
+      "错误处理"
+    ]
+  }
+}
