@@ -7,7 +7,7 @@ Anthropic API 兼容层
 import json
 import time
 import uuid
-from typing import Dict, Any, List, Optional, Union, Iterator
+from typing import Dict, Any, List, Optional, Union, Iterator, Tuple
 
 from flask import request, jsonify, Response, stream_with_context
 from werkzeug.exceptions import Unauthorized, BadRequest, InternalServerError
@@ -25,6 +25,35 @@ from multimodal_processor import MultimodalProcessor
 from tool_call_handler import ToolCallHandler
 from utils import Logger, ResponseHelper, IDGenerator
 from config import config
+
+
+def fix_done_marker_handling(chunk: str) -> Tuple[bool, Optional[str]]:
+    """
+    修复 [DONE] 标记处理逻辑
+    
+    Args:
+        chunk (str): 原始数据块
+        
+    Returns:
+        tuple: (is_done, data_str) - 是否为结束标记，以及提取的数据字符串
+    """
+    if not chunk or not isinstance(chunk, str):
+        return False, None
+    
+    if not chunk.startswith("data: "):
+        return False, None
+    
+    data_str = chunk[6:].strip()  # 移除 "data: " 前缀并去除空白字符
+    
+    # 检查是否为 [DONE] 标记
+    if data_str == "[DONE]":
+        return True, data_str
+    
+    # 跳过空数据
+    if not data_str:
+        return False, None
+    
+    return False, data_str
 
 
 class AnthropicAPIHandler:
@@ -168,7 +197,8 @@ class AnthropicAPIHandler:
             })
         
         # 转换用户和助手消息
-        messages = self.multimodal_processor.process_anthropic_messages(anthropic_request["messages"])
+        converted_messages = self.multimodal_processor.process_anthropic_messages(anthropic_request["messages"])
+        messages.extend(converted_messages)
         
         # 构建上游请求
         upstream_request: UpstreamRequest = {
@@ -260,72 +290,77 @@ class AnthropicAPIHandler:
                 
                 for chunk in result["generator"]:
                     try:
-                        # chunk 是 SSE 格式: "data: {json}"
-                        if chunk.startswith("data: "):
-                            data_str = chunk[6:]  # 移除 "data: " 前缀
-                            if data_str.strip() == "[DONE]":
-                                break
-                            
-                            # 跳过空数据或只包含换行符的数据
-                            if not data_str.strip():
-                                continue
-                            
-                            data = json.loads(data_str)
-                            
-                            # 从标准 OpenAI 格式中提取内容
-                            delta_content = ""
-                            tool_calls = []
-                            
-                            if "choices" in data and data["choices"]:
-                                choice = data["choices"][0]
-                                if "delta" in choice:
-                                    delta = choice["delta"]
-                                    # 内容可能在 content 或 role 字段中
-                                    if "content" in delta:
-                                        delta_content = delta["content"]
-                                    elif "tool_calls" in delta:
-                                        # 处理工具调用
-                                        for tool_call in delta["tool_calls"]:
-                                            if "function" in tool_call:
+                        # 使用修复后的处理逻辑
+                        is_done, data_str = fix_done_marker_handling(chunk)
+                        
+                        if is_done:
+                            break
+                        
+                        if data_str is None:
+                            continue
+                        
+                        data = json.loads(data_str)
+                        
+                        # 从标准 OpenAI 格式中提取内容
+                        delta_content = ""
+                        tool_calls = []
+                        
+                        if "choices" in data and data["choices"]:
+                            choice = data["choices"][0]
+                            if "delta" in choice:
+                                delta = choice["delta"]
+                                # 内容可能在 content 或 role 字段中
+                                if "content" in delta:
+                                    delta_content = delta["content"]
+                                elif "tool_calls" in delta:
+                                    # 处理工具调用
+                                    for tool_call in delta["tool_calls"]:
+                                        if "function" in tool_call and tool_call["function"]:
+                                            function_data = tool_call["function"]
+                                            if "name" in function_data and "arguments" in function_data:
                                                 tool_calls.append(tool_call)
-                                    elif "role" in delta and delta["role"] == "assistant":
-                                        # 跳过角色消息
-                                        continue
+                                elif "role" in delta and delta["role"] == "assistant":
+                                    # 跳过角色消息
+                                    continue
+                        
+                        if delta_content:
+                            # 处理思考链内容（检查是否包含思考标签）
+                            if "<think>" in delta_content or "</think>" in delta_content:
+                                processed_content = self.content_processor.process_content(delta_content, "thinking")
+                            else:
+                                processed_content = delta_content
                             
-                            if delta_content:
-                                # 处理思考链内容（检查是否包含思考标签）
-                                if "<think>" in delta_content or "</think>" in delta_content:
-                                    processed_content = self.content_processor.process_content(delta_content, "thinking")
-                                else:
-                                    processed_content = delta_content
+                            if processed_content:
+                                usage["output_tokens"] += len(processed_content) // 4
                                 
-                                if processed_content:
-                                    usage["output_tokens"] += len(processed_content) // 4
-                                    
-                                    # 发送 content_block_delta 事件
-                                    content_delta: AnthropicContentBlockDeltaEvent = {
-                                        "type": "content_block_delta",
-                                        "index": 0,
-                                        "delta": {
-                                            "type": "text_delta",
-                                            "text": processed_content
-                                        }
+                                # 发送 content_block_delta 事件
+                                content_delta: AnthropicContentBlockDeltaEvent = {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": processed_content
                                     }
-                                    yield f"event: {content_delta['type']}\ndata: {json.dumps(content_delta)}\n\n"
-                            
-                            # 处理工具调用
-                            if tool_calls:
-                                for i, tool_call in enumerate(tool_calls):
-                                    # 发送工具调用事件
-                                    tool_call_delta: AnthropicContentBlockDeltaEvent = {
-                                        "type": "content_block_delta",
-                                        "index": i + 1,  # 从1开始，因为0已经被文本内容占用
-                                        "delta": {
-                                            "type": "tool_call_delta",
-                                            "tool_call": tool_call
+                                }
+                                yield f"event: {content_delta['type']}\ndata: {json.dumps(content_delta)}\n\n"
+                        
+                        # 处理工具调用
+                        if tool_calls:
+                            for i, tool_call in enumerate(tool_calls):
+                                # 确保工具调用有完整的信息
+                                if "function" in tool_call and tool_call["function"]:
+                                    function_data = tool_call["function"]
+                                    if "name" in function_data and "arguments" in function_data:
+                                        # 发送工具调用事件
+                                        tool_call_delta: AnthropicContentBlockDeltaEvent = {
+                                            "type": "content_block_delta",
+                                            "index": i + 1,  # 从1开始，因为0已经被文本内容占用
+                                            "delta": {
+                                                "type": "tool_call_delta",
+                                                "tool_call": tool_call
+                                            }
                                         }
-                                    }
-                                    yield f"event: {tool_call_delta['type']}\ndata: {json.dumps(tool_call_delta)}\n\n"
+                                        yield f"event: {tool_call_delta['type']}\ndata: {json.dumps(tool_call_delta)}\n\n"
                     
                     except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
                         continue
@@ -406,22 +441,15 @@ class AnthropicAPIHandler:
             for chunk in generator:
                 chunk_count += 1
                 try:
-                    # chunk 是 SSE 格式: "data: {json}"
-                    if not chunk or not isinstance(chunk, str):
-                        self.logger.warning(f"Invalid chunk {chunk_count}: {type(chunk)}, content: {repr(chunk)}")
-                        continue
-                        
-                    if not chunk.startswith("data: "):
-                        self.logger.debug(f"Chunk {chunk_count} not starting with 'data: ': {repr(chunk[:100])}")
-                        continue
+                    # 使用修复后的处理逻辑
+                    is_done, data_str = fix_done_marker_handling(chunk)
                     
-                    data_str = chunk[6:]  # 移除 "data: " 前缀
-                    if data_str.strip() == "[DONE]":
+                    if is_done:
                         self.logger.debug(f"Stream completed after {chunk_count} chunks")
                         break
                     
-                    # 跳过空数据或只包含换行符的数据
-                    if not data_str.strip() or data_str.strip() == "[DONE]":
+                    if data_str is None:
+                        empty_chunks += 1
                         continue
                     
                     try:
@@ -444,8 +472,10 @@ class AnthropicAPIHandler:
                             elif "tool_calls" in delta:
                                 # 处理工具调用
                                 for tool_call in delta["tool_calls"]:
-                                    if "function" in tool_call:
-                                        tool_calls.append(tool_call)
+                                    if "function" in tool_call and tool_call["function"]:
+                                        function_data = tool_call["function"]
+                                        if "name" in function_data and "arguments" in function_data:
+                                            tool_calls.append(tool_call)
                             elif "role" in delta and delta["role"] == "assistant":
                                 # 跳过角色消息
                                 self.logger.debug(f"Chunk {chunk_count}: Skipping role message")
@@ -461,7 +491,7 @@ class AnthropicAPIHandler:
                     
                     if delta_content:
                         # 处理思考链内容（检查是否包含思考标签）
-                        if "</think>" in delta_content or "</think>" in delta_content:
+                        if "<think>" in delta_content or "</think>" in delta_content:
                             try:
                                 processed_content = self.content_processor.process_content(delta_content, "thinking")
                                 self.logger.debug(f"Chunk {chunk_count}: Processed thinking content: {repr(processed_content)}")
@@ -537,14 +567,34 @@ class AnthropicAPIHandler:
             if tool_calls:
                 # 在Anthropic API中，工具调用作为单独的内容块处理
                 for tool_call in tool_calls:
-                    # 生成唯一的工具调用ID以确保符合API规范
-                    tool_use_id = f"toolu_{uuid.uuid4().hex[:12]}"
-                    response["content"].append({
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": tool_call.get("function", {}).get("name", ""),
-                        "input": json.loads(tool_call.get("function", {}).get("arguments", "{}"))
-                    })
+                    # 确保工具调用有完整的信息
+                    function_data = tool_call.get("function", {})
+                    if "name" in function_data and "arguments" in function_data:
+                        # 生成唯一的工具调用ID以确保符合API规范
+                        tool_use_id = f"toolu_{uuid.uuid4().hex[:12]}"
+                        try:
+                            # 安全地解析参数
+                            arguments = function_data.get("arguments", "{}")
+                            if isinstance(arguments, str):
+                                input_data = json.loads(arguments)
+                            else:
+                                input_data = arguments
+                            
+                            response["content"].append({
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": function_data.get("name", ""),
+                                "input": input_data
+                            })
+                        except (json.JSONDecodeError, TypeError) as e:
+                            self.logger.warning(f"工具调用参数解析失败: {e}, tool_call: {tool_call}")
+                            # 添加一个空的工具调用以保持API兼容性
+                            response["content"].append({
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": function_data.get("name", ""),
+                                "input": {}
+                            })
             
             return jsonify(response)
             
