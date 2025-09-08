@@ -25,6 +25,7 @@ from multimodal_processor import MultimodalProcessor
 from tool_call_handler import ToolCallHandler
 from utils import Logger, ResponseHelper, IDGenerator
 from config import config
+from performance import RequestTimer
 
 
 def fix_done_marker_handling(chunk: str) -> Tuple[bool, Optional[str]]:
@@ -82,29 +83,33 @@ class AnthropicAPIHandler:
         Returns:
             Response: Flask 响应对象
         """
-        try:
-            # 验证 API 密钥
-            self._validate_api_key()
-            
-            # 解析请求
-            anthropic_request = self._parse_request()
-            
-            # 转换为内部格式
-            upstream_request = self._convert_to_upstream(anthropic_request)
-            
-            # 处理请求
-            if anthropic_request.get("stream", False):
-                return self._handle_streaming(upstream_request, anthropic_request)
-            else:
-                return self._handle_non_streaming(upstream_request, anthropic_request)
+        with RequestTimer("/v1/messages") as timer:
+            try:
+                # 验证 API 密钥
+                self._validate_api_key()
                 
-        except Unauthorized as e:
-            return jsonify({"error": {"type": "authentication_error", "message": str(e)}}), 401
-        except BadRequest as e:
-            return jsonify({"error": {"type": "invalid_request_error", "message": str(e)}}), 400
-        except Exception as e:
-            self.logger.error(f"处理 Anthropic 请求时发生错误: {e}")
-            return jsonify({"error": {"type": "internal_error", "message": "Internal server error"}}), 500
+                # 解析请求
+                anthropic_request = self._parse_request()
+                
+                # 转换为内部格式
+                upstream_request = self._convert_to_upstream(anthropic_request)
+                
+                # 处理请求
+                if anthropic_request.get("stream", False):
+                    return self._handle_streaming(upstream_request, anthropic_request)
+                else:
+                    return self._handle_non_streaming(upstream_request, anthropic_request)
+                    
+            except Unauthorized as e:
+                timer.success = False
+                return jsonify({"error": {"type": "authentication_error", "message": str(e)}}), 401
+            except BadRequest as e:
+                timer.success = False
+                return jsonify({"error": {"type": "invalid_request_error", "message": str(e)}}), 400
+            except Exception as e:
+                timer.success = False
+                self.logger.error(f"处理 Anthropic 请求时发生错误: {e}")
+                return jsonify({"error": {"type": "internal_error", "message": "Internal server error"}}), 500
     
     def _validate_api_key(self) -> None:
         """验证 API 密钥
@@ -136,7 +141,17 @@ class AnthropicAPIHandler:
             BadRequest: 当请求格式无效时
         """
         try:
-            data = request.get_json()
+            # 尝试手动解析 JSON 以获得更好的错误处理
+            raw_data = request.get_data(as_text=True)
+            
+            import json
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError as json_error:
+                self.logger.error(f"JSON decode error: {json_error}")
+                self.logger.error(f"Raw data: {repr(raw_data)}")
+                raise BadRequest(f"Invalid JSON format: {json_error}")
+            
             if not data:
                 raise BadRequest("Missing request body")
             
@@ -153,6 +168,7 @@ class AnthropicAPIHandler:
             return data
             
         except Exception as e:
+            self.logger.error(f"Request parsing error: {type(e).__name__}: {e}")
             raise BadRequest(f"Invalid request format: {e}")
     
     def _convert_to_upstream(self, anthropic_request: AnthropicRequest) -> UpstreamRequest:
