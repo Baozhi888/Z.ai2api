@@ -71,6 +71,15 @@ class AppConfig:
         # 默认映射，任何未指定的模型都映射到 glm-4.5v
     })
     
+    # ===== 工具调用配置 =====
+    function_call_enabled: bool = True
+    max_json_scan: int = 200000
+    sse_heartbeat_seconds: float = 15.0
+    include_thinking: bool = False
+    tool_call_timeout: int = 30
+    tool_call_retry_count: int = 2
+    tool_call_retry_backoff: float = 0.6
+    
     # ===== 高级配置 =====
     enable_performance_monitoring: bool = True
     enable_request_tracing: bool = True
@@ -147,6 +156,15 @@ class AppConfig:
             
             # ===== Anthropic API 配置 =====
             anthropic_api_key=os.getenv("ZAI_ANTHROPIC_API_KEY"),
+            
+            # ===== 工具调用配置 =====
+            function_call_enabled=str_to_bool(os.getenv("ZAI_FUNCTION_CALL_ENABLED"), cls.function_call_enabled),
+            max_json_scan=int(os.getenv("ZAI_MAX_JSON_SCAN", cls.max_json_scan)),
+            sse_heartbeat_seconds=float(os.getenv("ZAI_SSE_HEARTBEAT_SECONDS", cls.sse_heartbeat_seconds)),
+            include_thinking=str_to_bool(os.getenv("ZAI_INCLUDE_THINKING"), cls.include_thinking),
+            tool_call_timeout=int(os.getenv("ZAI_TOOL_CALL_TIMEOUT", cls.tool_call_timeout)),
+            tool_call_retry_count=int(os.getenv("ZAI_TOOL_CALL_RETRY_COUNT", cls.tool_call_retry_count)),
+            tool_call_retry_backoff=float(os.getenv("ZAI_TOOL_CALL_RETRY_BACKOFF", cls.tool_call_retry_backoff)),
             
             # ===== 高级配置 =====
             enable_performance_monitoring=str_to_bool(os.getenv("ZAI_ENABLE_PERFORMANCE_MONITORING"), cls.enable_performance_monitoring),

@@ -110,10 +110,18 @@ class RequestsHttpClient(HttpClientInterface):
         self.close()
     
     def _safe_iter_lines(self, response):
-        """安全的迭代器，确保响应被正确关闭"""
+        """安全的迭代器，确保响应被正确关闭并正确处理UTF-8编码"""
         try:
             for line in response.iter_lines():
-                yield line
+                if line:
+                    # 确保正确的UTF-8解码
+                    if isinstance(line, bytes):
+                        # 使用 'replace' 错误处理策略避免解码错误
+                        yield line
+                    else:
+                        yield line.encode('utf-8')
+                else:
+                    yield line
         finally:
             response.close()
     
@@ -132,12 +140,20 @@ class RequestsHttpClient(HttpClientInterface):
         """析构函数，确保资源释放"""
         self.close()
     
+    def _ensure_utf8_response(self, response):
+        """确保响应头正确设置UTF-8编码"""
+        response.encoding = 'utf-8'  # 强制使用UTF-8编码
+        return response
+    
     def get(self, url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 8) -> Dict[str, Any]:
         """发送 GET 请求"""
         self._check_closed()
         merged_headers = {**self.base_headers, **(headers or {})}
+        # 确保接受UTF-8编码
+        merged_headers['Accept-Charset'] = 'utf-8'
         try:
             response = self.session.get(url, headers=merged_headers, timeout=timeout)
+            self._ensure_utf8_response(response)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.Timeout:
@@ -153,8 +169,12 @@ class RequestsHttpClient(HttpClientInterface):
         """发送流式 POST 请求"""
         self._check_closed()
         merged_headers = {**self.base_headers, **(headers or {})}
+        # 确保发送和接受UTF-8编码
+        merged_headers['Accept-Charset'] = 'utf-8'
+        merged_headers['Content-Type'] = 'application/json; charset=utf-8'
         try:
             response = self.session.post(url, json=json_data, headers=merged_headers, stream=True, timeout=timeout)
+            self._ensure_utf8_response(response)
             response.raise_for_status()
             return self._safe_iter_lines(response)
         except requests.exceptions.Timeout:
@@ -170,8 +190,12 @@ class RequestsHttpClient(HttpClientInterface):
         """发送普通 POST 请求"""
         self._check_closed()
         merged_headers = {**self.base_headers, **(headers or {})}
+        # 确保发送和接受UTF-8编码
+        merged_headers['Accept-Charset'] = 'utf-8'
+        merged_headers['Content-Type'] = 'application/json; charset=utf-8'
         try:
             response = self.session.post(url, json=json_data, headers=merged_headers, timeout=timeout)
+            self._ensure_utf8_response(response)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.Timeout:
@@ -360,7 +384,11 @@ class ZAIClient:
                     if data_str == b"[DONE]":
                         continue
                     
-                    data = json.loads(data_str.decode('utf-8', 'ignore'))
+                    # 确保正确的 UTF-8 解码
+                    if isinstance(data_str, bytes):
+                        data_str = data_str.decode('utf-8', 'replace')  # 使用 replace 而不是 ignore
+                    
+                    data = json.loads(data_str)
                     
                     # 提取内容
                     if "data" in data:
@@ -385,26 +413,40 @@ class ZAIClient:
                             # 处理工具调用
                             elif current_phase == "tool_call":
                                 edit_content = inner_data.get("edit_content", "")
+                                if config.debug_mode:
+                                    print(f"工具调用阶段，edit_content: {edit_content[:200]}")
+                                
                                 if edit_content and "<glm_block >" in edit_content:
                                     blocks = edit_content.split("<glm_block >")
-                                    for block in blocks:
+                                    for block_idx, block in enumerate(blocks):
                                         if "</glm_block>" in block:
                                             try:
                                                 block_content = block[:-12]  # 移除 </glm_block>
                                                 tool_data = json.loads(block_content)
                                                 
+                                                if config.debug_mode:
+                                                    print(f"解析到工具数据: {tool_data}")
+                                                
                                                 if tool_data.get("type") == "tool_call":
                                                     metadata = tool_data.get("data", {}).get("metadata", {})
                                                     if metadata.get("id") and metadata.get("name"):
+                                                        # 生成符合规范的工具调用ID
+                                                        tool_id = f"call_{metadata['id']}" if not metadata["id"].startswith("call_") else metadata["id"]
+                                                        
                                                         tool_calls.append({
-                                                            "id": metadata["id"],
+                                                            "id": tool_id,
                                                             "type": "function",
                                                             "function": {
                                                                 "name": metadata["name"],
                                                                 "arguments": json.dumps(metadata.get("arguments", {}))
                                                             }
                                                         })
-                                            except (json.JSONDecodeError, KeyError):
+                                                        
+                                                        if config.debug_mode:
+                                                            print(f"添加工具调用: {metadata['name']}")
+                                            except (json.JSONDecodeError, KeyError) as e:
+                                                if config.debug_mode:
+                                                    print(f"工具调用解析错误: {e}, block: {block[:200]}")
                                                 continue
                             
                             # 处理回答内容

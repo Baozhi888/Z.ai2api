@@ -19,6 +19,8 @@ from cache import get_cache
 from performance import get_monitor, RequestTimer
 from tool_call_manager import ToolCallManager
 from tool_call_error_handler import ToolCallErrorHandler, ToolCallParseError
+from tool_prompt_injector import ToolPromptInjector
+from tool_call_extractor import ToolCallExtractor
 
 
 class ChatService:
@@ -36,6 +38,8 @@ class ChatService:
         self.cache = get_cache()
         self.tool_call_manager = ToolCallManager()
         self.tool_call_error_handler = ToolCallErrorHandler()
+        self.tool_prompt_injector = ToolPromptInjector()
+        self.tool_call_extractor = ToolCallExtractor(config.max_json_scan)
         self._models_cache_ttl = 300  # 5分钟缓存模型列表
         self._auth_token_cache_ttl = 600  # 10分钟缓存认证令牌
     
@@ -127,15 +131,29 @@ class ChatService:
                 
             is_stream = request_data.get("stream", False)
             
-            # 检查是否包含工具调用
-            has_tools = bool(request_data.get("tools"))
+            # 提取工具相关参数
+            tools = request_data.get("tools", [])
+            tool_choice = request_data.get("tool_choice")
+            has_tools = bool(tools)
             
             # 处理多模态消息
             original_messages = request_data.get("messages", [])
             
+            # 如果有工具，注入提示（在处理系统消息之前）
+            if tools and config.function_call_enabled and tool_choice != "none":
+                messages_with_tools = self.tool_prompt_injector.inject_tools_into_messages(
+                    original_messages, tools, tool_choice
+                )
+                self.logger.debug(f"已注入工具提示，工具数量: {len(tools)}")
+            else:
+                messages_with_tools = original_messages
+            
+            # 处理包含工具结果的消息
+            messages_with_tools = self.tool_prompt_injector.process_tool_messages(messages_with_tools)
+            
             # 处理系统消息
             processed_messages = []
-            for msg in original_messages:
+            for msg in messages_with_tools:
                 processed_msg = self._process_system_message(msg)
                 processed_messages.append(processed_msg)
             
@@ -164,17 +182,24 @@ class ChatService:
                 },
                 "variables": self._get_variables(),
                 "model_item": {},
-                "tools": request_data.get("tools") if not request_data.get("reasoning", False) and request_data.get("tools") else None,
+                # 注意：因为已经在消息中注入了工具提示，这里不再传递tools给上游
+                # "tools": request_data.get("tools") if not request_data.get("reasoning", False) else None,
             }
             
             if config.debug_mode:
                 self.logger.debug("上游请求: %s", json.dumps(upstream_data, ensure_ascii=False))
+                if has_tools:
+                    self.logger.debug("工具调用已启用（通过提示注入），工具数量: %d", len(tools))
+                    for i, tool in enumerate(tools):
+                        self.logger.debug("工具 %d: %s", i + 1, tool.get("function", {}).get("name", "未知"))
+                else:
+                    self.logger.debug("工具调用未启用")
             
             try:
                 if is_stream:
                     # 流式请求使用流式 API
                     upstream = self.zai_client.create_chat_completion(upstream_data, chat_id)
-                    return self._handle_stream_response(upstream, model)
+                    return self._handle_stream_response_enhanced(upstream, model, tools, tool_choice)
                 else:
                     # 非流式请求使用普通 API，避免等待流式响应完成
                     # 如果是多模态请求，使用更长的超时时间
@@ -184,7 +209,7 @@ class ChatService:
                         chat_id, 
                         timeout=timeout
                     )
-                    return self._handle_normal_response_direct(upstream, model)
+                    return self._handle_normal_response_enhanced(upstream, model, tools, tool_choice)
             
             except HttpClientError as e:
                 timer.success = False
@@ -206,6 +231,229 @@ class ChatService:
                             for call in self.tool_call_manager.active_calls.values()
                         )
                         monitor.metrics.increment_tool_calls(total_tokens // tool_call_count if tool_call_count > 0 else 0)
+    
+    def _handle_stream_response_enhanced(self, upstream: Iterator[bytes], model: str, 
+                                        tools: List[Dict[str, Any]], tool_choice: Any) -> Dict[str, Any]:
+        """处理流式响应（增强版）
+        
+        Args:
+            upstream: 上游流式响应数据
+            model: 使用的模型名称
+            tools: 工具列表
+            tool_choice: 工具选择策略
+            
+        Returns:
+            Dict[str, Any]: 流式响应结果
+        """
+        def stream_generator():
+            # 判断是否需要缓冲（有工具时缓冲所有内容）
+            buffering_mode = bool(tools) and config.function_call_enabled
+            buffer_content = ""
+            last_heartbeat = time.time()
+            
+            chat_id = IDGenerator.generate_id('chatcmpl')
+            created_ts = int(time.time())
+            content_index = 0
+            has_thinking = False
+            
+            # 重置工具调用管理器
+            self.tool_call_manager.reset_state()
+            
+            # 发送开始消息
+            start_data = {
+                'id': chat_id,
+                'object': 'chat.completion.chunk',
+                'created': created_ts,
+                'model': model,
+                'choices': [{'index': 0, 'delta': {'role': 'assistant'}}]
+            }
+            yield f"data: {json.dumps(start_data, ensure_ascii=False)}\n\n"
+            
+            # 处理流式内容
+            for data in self._parse_upstream_stream(upstream):
+                # 心跳检查
+                if time.time() - last_heartbeat >= config.sse_heartbeat_seconds:
+                    yield ": keep-alive\n\n"
+                    last_heartbeat = time.time()
+                
+                chunk_data = data.get("data", {})
+                
+                # 检查是否完成
+                if chunk_data.get("done"):
+                    # 流结束，处理缓冲内容
+                    if buffering_mode and buffer_content:
+                        # 尝试提取工具调用
+                        tool_calls = self.tool_call_extractor.extract_tool_calls(buffer_content)
+                        
+                        if tool_calls:
+                            # 发送工具调用
+                            tool_chunk = {
+                                'id': chat_id,
+                                'object': 'chat.completion.chunk',
+                                'created': created_ts,
+                                'model': model,
+                                'choices': [{
+                                    'index': 0,
+                                    'delta': {
+                                        'content': None,  # 重要：有工具调用时 content 必须为 null
+                                        'tool_calls': tool_calls
+                                    }
+                                }]
+                            }
+                            yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
+                            finish_reason = "tool_calls"
+                        else:
+                            # 没有工具调用，发送纯文本
+                            cleaned_content = self.tool_call_extractor.strip_tool_json_from_text(buffer_content)
+                            if cleaned_content:
+                                text_chunk = {
+                                    'id': chat_id,
+                                    'object': 'chat.completion.chunk',
+                                    'created': created_ts,
+                                    'model': model,
+                                    'choices': [{
+                                        'index': 0,
+                                        'delta': {'content': cleaned_content}
+                                    }]
+                                }
+                                yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
+                            finish_reason = "stop"
+                    else:
+                        finish_reason = "stop"
+                    
+                    # 发送结束块
+                    finish_data = {
+                        'id': chat_id,
+                        'object': 'chat.completion.chunk',
+                        'created': created_ts,
+                        'model': model,
+                        'choices': [{
+                            'index': 0,
+                            'delta': {},
+                            'finish_reason': finish_reason
+                        }],
+                        'usage': chunk_data.get("usage", {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0
+                        })
+                    }
+                    yield f"data: {json.dumps(finish_data, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                
+                # 提取内容
+                content = self._extract_content(data)
+                if not content:
+                    continue
+                
+                if buffering_mode:
+                    # 缓冲模式：累积内容
+                    buffer_content += content
+                else:
+                    # 非缓冲模式：直接发送
+                    # 处理思考链
+                    phase = chunk_data.get("phase")
+                    if phase == "thinking":
+                        has_thinking = True
+                        if not config.include_thinking:
+                            continue  # 跳过思考内容
+                        
+                        thinking_data = {
+                            'id': chat_id,
+                            'object': 'chat.completion.chunk',
+                            'created': created_ts,
+                            'model': model,
+                            'choices': [{
+                                'index': content_index,
+                                'delta': {
+                                    'role': 'assistant',
+                                    'thinking': {'content': content}
+                                }
+                            }]
+                        }
+                        yield f"data: {json.dumps(thinking_data, ensure_ascii=False)}\n\n"
+                        content_index += 1
+                    else:
+                        # 普通内容
+                        content_chunk = {
+                            'id': chat_id,
+                            'object': 'chat.completion.chunk',
+                            'created': created_ts,
+                            'model': model,
+                            'choices': [{
+                                'index': 0,
+                                'delta': {'content': content}
+                            }]
+                        }
+                        yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+            
+            # 如果流意外结束，发送 [DONE]
+            yield "data: [DONE]\n\n"
+        
+        return {
+            "type": "stream",
+            "generator": stream_generator(),
+            "model": model
+        }
+    
+    def _handle_normal_response_enhanced(self, upstream: Dict[str, Any], model: str,
+                                        tools: List[Dict[str, Any]], tool_choice: Any) -> Dict[str, Any]:
+        """处理普通响应（增强版）
+        
+        Args:
+            upstream: 上游响应数据
+            model: 使用的模型名称
+            tools: 工具列表
+            tool_choice: 工具选择策略
+            
+        Returns:
+            Dict[str, Any]: 聊天完成响应数据
+        """
+        # 提取内容
+        content = ""
+        if "choices" in upstream and upstream["choices"]:
+            message = upstream["choices"][0].get("message", {})
+            content = message.get("content", "")
+        
+        # 检查工具调用
+        tool_calls = None
+        finish_reason = "stop"
+        
+        if tools and config.function_call_enabled:
+            tool_calls = self.tool_call_extractor.extract_tool_calls(content)
+            if tool_calls:
+                # 清理内容中的工具调用 JSON
+                content = self.tool_call_extractor.strip_tool_json_from_text(content)
+                finish_reason = "tool_calls"
+        
+        # 构建响应（严格遵循 OpenAI 格式）
+        message_obj = {
+            "role": "assistant",
+            "content": None if tool_calls else (content or "")  # 有工具调用时 content 必须为 null
+        }
+        
+        if tool_calls:
+            message_obj["tool_calls"] = tool_calls
+        
+        response = {
+            "id": IDGenerator.generate_id("chatcmpl"),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message_obj,
+                "finish_reason": finish_reason
+            }],
+            "usage": upstream.get("usage", {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            })
+        }
+        
+        return response
     
     def _handle_stream_response(self, upstream: Iterator[bytes], model: str) -> Dict[str, Any]:
         """处理流式响应

@@ -202,7 +202,7 @@ class AnthropicAPIHandler:
         
         # 构建上游请求
         upstream_request: UpstreamRequest = {
-            "stream": True,  # 总是使用流式以获得更好的性能
+            "stream": anthropic_request.get("stream", False),  # 遵循原始请求的流式设置
             "chat_id": chat_id,
             "id": msg_id,
             "model": model,
@@ -214,20 +214,36 @@ class AnthropicAPIHandler:
         
         # 处理工具调用
         if "tools" in anthropic_request:
-            # 转换 Anthropic 工具格式为内部格式
+            # 转换工具格式为内部格式，兼容两种格式
             tools = []
             for tool in anthropic_request["tools"]:
-                if tool.get("type") == "function":
-                    input_schema = tool.get("input_schema", {})
+                # 兼容两种格式：直接格式和嵌套格式
+                if "function" in tool:
+                    # OpenAI 格式的工具定义 (type=function, function={name, description, parameters})
+                    func = tool["function"]
+                    tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": func.get("name"),
+                            "description": func.get("description", ""),
+                            "parameters": func.get("parameters", {})
+                        }
+                    })
+                    self.logger.debug(f"转换 OpenAI 格式工具: {func.get('name')}")
+                else:
+                    # Anthropic 格式的工具定义 (直接包含 name, description, input_schema)
                     tools.append({
                         "type": "function",
                         "function": {
                             "name": tool.get("name"),
                             "description": tool.get("description", ""),
-                            "parameters": input_schema
+                            "parameters": tool.get("input_schema", {})
                         }
                     })
+                    self.logger.debug(f"转换 Anthropic 格式工具: {tool.get('name')}")
+            
             upstream_request["tools"] = tools
+            self.logger.debug(f"共转换 {len(tools)} 个工具")
             
             if "tool_choice" in anthropic_request:
                 tool_choice = anthropic_request["tool_choice"]
@@ -238,6 +254,7 @@ class AnthropicAPIHandler:
                     }
                 else:
                     upstream_request["tool_choice"] = tool_choice
+                self.logger.debug(f"设置 tool_choice: {tool_choice}")
         
         return upstream_request
     
@@ -426,117 +443,146 @@ class AnthropicAPIHandler:
         """
         try:
             # 获取完整响应
-            self.logger.debug(f"开始处理非流式请求，上游请求: {upstream_request}")
+            self.logger.debug(f"开始处理非流式请求，上游请求: {json.dumps(upstream_request, ensure_ascii=False, indent=2)}")
             result = self.chat_service.create_chat_completion(upstream_request)
             self.logger.debug(f"获取到上游响应结果: {type(result)}")
             
-            # 收集所有内容
-            full_content = ""
-            tool_calls = []
-            chunk_count = 0
-            empty_chunks = 0
-            generator = result["generator"]
-            self.logger.debug(f"开始处理生成器，类型: {type(generator)}")
-            
-            for chunk in generator:
-                chunk_count += 1
-                try:
-                    # 使用修复后的处理逻辑
-                    is_done, data_str = fix_done_marker_handling(chunk)
-                    
-                    if is_done:
-                        self.logger.debug(f"Stream completed after {chunk_count} chunks")
-                        break
-                    
-                    if data_str is None:
-                        empty_chunks += 1
-                        continue
-                    
+            # 检查是否是流式响应（包含generator）还是直接响应
+            if isinstance(result, dict) and "generator" in result:
+                # 流式响应 - 收集所有内容
+                full_content = ""
+                tool_calls = []
+                chunk_count = 0
+                empty_chunks = 0
+                generator = result["generator"]
+                self.logger.debug(f"开始处理生成器，类型: {type(generator)}")
+                
+                for chunk in generator:
+                    chunk_count += 1
                     try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"Chunk {chunk_count} JSON decode error: {e}, data: {repr(data_str[:200])}")
-                        continue
-                    
-                    self.logger.debug(f"Chunk {chunk_count}: {data}")
-                    
-                    # 从标准 OpenAI 格式中提取内容
-                    delta_content = ""
-                    if "choices" in data and data["choices"]:
-                        choice = data["choices"][0]
-                        if "delta" in choice:
-                            delta = choice["delta"]
-                            # 内容可能在 content 或 role 字段中
-                            if "content" in delta:
-                                delta_content = delta["content"]
-                            elif "tool_calls" in delta:
-                                # 处理工具调用
-                                for tool_call in delta["tool_calls"]:
-                                    if "function" in tool_call and tool_call["function"]:
-                                        function_data = tool_call["function"]
-                                        if "name" in function_data and "arguments" in function_data:
-                                            tool_calls.append(tool_call)
-                            elif "role" in delta and delta["role"] == "assistant":
-                                # 跳过角色消息
-                                self.logger.debug(f"Chunk {chunk_count}: Skipping role message")
-                                continue
-                            else:
-                                self.logger.debug(f"Chunk {chunk_count}: Delta has no content: {delta}")
-                        else:
-                            self.logger.debug(f"Chunk {chunk_count}: Choice has no delta: {choice}")
-                    else:
-                        self.logger.debug(f"Chunk {chunk_count}: No choices in data: {list(data.keys())}")
-                    
-                    self.logger.debug(f"Chunk {chunk_count}: Delta content: {repr(delta_content)}")
-                    
-                    if delta_content:
-                        # 处理思考链内容（检查是否包含思考标签）
-                        if "<think>" in delta_content or "</think>" in delta_content:
-                            try:
-                                processed_content = self.content_processor.process_content(delta_content, "thinking")
-                                self.logger.debug(f"Chunk {chunk_count}: Processed thinking content: {repr(processed_content)}")
-                            except Exception as e:
-                                self.logger.error(f"Chunk {chunk_count}: Content processing error: {e}")
-                                processed_content = delta_content  # 使用原始内容作为后备
-                        else:
-                            processed_content = delta_content
-                            self.logger.debug(f"Chunk {chunk_count}: Raw content: {repr(processed_content)}")
+                        # 使用修复后的处理逻辑
+                        is_done, data_str = fix_done_marker_handling(chunk)
                         
-                        if processed_content:
-                            full_content += processed_content
-                            self.logger.debug(f"Chunk {chunk_count}: Added content, total length: {len(full_content)}")
+                        if is_done:
+                            self.logger.debug(f"Stream completed after {chunk_count} chunks")
+                            break
+                        
+                        if data_str is None:
+                            empty_chunks += 1
+                            continue
+                        
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError as e:
+                            self.logger.warning(f"Chunk {chunk_count} JSON decode error: {e}, data: {repr(data_str[:200])}")
+                            continue
+                        
+                        self.logger.debug(f"Chunk {chunk_count}: {data}")
+                        
+                        # 从标准 OpenAI 格式中提取内容
+                        delta_content = ""
+                        if "choices" in data and data["choices"]:
+                            choice = data["choices"][0]
+                            if "delta" in choice:
+                                delta = choice["delta"]
+                                # 内容可能在 content 或 role 字段中
+                                if "content" in delta:
+                                    delta_content = delta["content"]
+                                elif "tool_calls" in delta:
+                                    # 处理工具调用
+                                    for tool_call in delta["tool_calls"]:
+                                        if "function" in tool_call and tool_call["function"]:
+                                            function_data = tool_call["function"]
+                                            if "name" in function_data and "arguments" in function_data:
+                                                tool_calls.append(tool_call)
+                                elif "role" in delta and delta["role"] == "assistant":
+                                    # 跳过角色消息
+                                    self.logger.debug(f"Chunk {chunk_count}: Skipping role message")
+                                    continue
+                                else:
+                                    self.logger.debug(f"Chunk {chunk_count}: Delta has no content: {delta}")
+                            else:
+                                self.logger.debug(f"Chunk {chunk_count}: Choice has no delta: {choice}")
                         else:
-                            self.logger.debug(f"Chunk {chunk_count}: No content after processing")
-                    else:
-                        empty_chunks += 1
-                        self.logger.debug(f"Chunk {chunk_count}: No delta content (empty chunks: {empty_chunks})")
+                            self.logger.debug(f"Chunk {chunk_count}: No choices in data: {list(data.keys())}")
+                        
+                        self.logger.debug(f"Chunk {chunk_count}: Delta content: {repr(delta_content)}")
+                        
+                        if delta_content:
+                            # 处理思考链内容（检查是否包含思考标签）
+                            if "<think>" in delta_content or "</think>" in delta_content:
+                                try:
+                                    processed_content = self.content_processor.process_content(delta_content, "thinking")
+                                    self.logger.debug(f"Chunk {chunk_count}: Processed thinking content: {repr(processed_content)}")
+                                except Exception as e:
+                                    self.logger.error(f"Chunk {chunk_count}: Content processing error: {e}")
+                                    processed_content = delta_content  # 使用原始内容作为后备
+                            else:
+                                processed_content = delta_content
+                                self.logger.debug(f"Chunk {chunk_count}: Raw content: {repr(processed_content)}")
+                            
+                            if processed_content:
+                                full_content += processed_content
+                                self.logger.debug(f"Chunk {chunk_count}: Added content, total length: {len(full_content)}")
+                            else:
+                                self.logger.debug(f"Chunk {chunk_count}: No content after processing")
+                        else:
+                            empty_chunks += 1
+                            self.logger.debug(f"Chunk {chunk_count}: No delta content (empty chunks: {empty_chunks})")
+                        
+                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                        self.logger.error(f"Chunk {chunk_count} parsing error: {type(e).__name__}: {e}")
+                        self.logger.debug(f"Chunk {chunk_count} raw content: {repr(chunk[:500])}")
+                        continue
+                    except Exception as e:
+                        self.logger.error(f"Chunk {chunk_count} unexpected error: {type(e).__name__}: {e}")
+                        continue
+            
+                self.logger.info(f"Stream processing completed:")
+                self.logger.info(f"  - Total chunks processed: {chunk_count}")
+                self.logger.info(f"  - Empty chunks: {empty_chunks}")
+                self.logger.info(f"  - Final content length: {len(full_content)}")
+                self.logger.info(f"  - Tool calls collected: {len(tool_calls)}")
+                self.logger.info(f"  - Final content preview: {repr(full_content[:200])}")
+                
+                # 即使没有文本内容，也可能有工具调用
+                if not full_content and not tool_calls:
+                    self.logger.warning("No content or tool calls collected from stream")
+                    # 返回错误响应
+                    return jsonify({
+                        "id": f"msg_{uuid.uuid4().hex}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "抱歉，处理请求时出现错误，请稍后重试。"}],
+                        "model": anthropic_request["model"],
+                        "stop_reason": "error",
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    })
+            else:
+                # 直接响应（从 services.py 的 _handle_normal_response_enhanced 返回）
+                self.logger.debug("处理直接响应（非流式）")
+                
+                # 从 OpenAI 格式转换为 Anthropic 格式
+                if "choices" in result and result["choices"]:
+                    choice = result["choices"][0]
+                    message = choice.get("message", {})
+                    full_content = message.get("content", "")
+                    tool_calls = message.get("tool_calls", [])
                     
-                except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
-                    self.logger.error(f"Chunk {chunk_count} parsing error: {type(e).__name__}: {e}")
-                    self.logger.debug(f"Chunk {chunk_count} raw content: {repr(chunk[:500])}")
-                    continue
-                except Exception as e:
-                    self.logger.error(f"Chunk {chunk_count} unexpected error: {type(e).__name__}: {e}")
-                    continue
-            
-            self.logger.info(f"Stream processing completed:")
-            self.logger.info(f"  - Total chunks processed: {chunk_count}")
-            self.logger.info(f"  - Empty chunks: {empty_chunks}")
-            self.logger.info(f"  - Final content length: {len(full_content)}")
-            self.logger.info(f"  - Final content preview: {repr(full_content[:200])}")
-            
-            if not full_content:
-                self.logger.warning("No content collected from stream")
-                # 返回错误响应
-                return jsonify({
-                    "id": f"msg_{uuid.uuid4().hex}",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "抱歉，处理请求时出现错误，请稍后重试。"}],
-                    "model": anthropic_request["model"],
-                    "stop_reason": "error",
-                    "usage": {"input_tokens": 0, "output_tokens": 0}
-                })
+                    self.logger.info(f"Direct response processing:")
+                    self.logger.info(f"  - Content length: {len(full_content) if full_content else 0}")
+                    self.logger.info(f"  - Tool calls: {len(tool_calls)}")
+                else:
+                    self.logger.error("Invalid response format from services")
+                    return jsonify({
+                        "id": f"msg_{uuid.uuid4().hex}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "抱歉，处理请求时出现错误。"}],
+                        "model": anthropic_request["model"],
+                        "stop_reason": "error",
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    })
             
             # 构建响应
             response_content = []
@@ -559,7 +605,7 @@ class AnthropicAPIHandler:
                 "stop_reason": stop_reason,
                 "usage": {
                     "input_tokens": len(str(anthropic_request.get("messages", []))) // 4,
-                    "output_tokens": len(full_content) // 4
+                    "output_tokens": len(full_content) // 4 if full_content else 0
                 }
             }
             
@@ -567,11 +613,21 @@ class AnthropicAPIHandler:
             if tool_calls:
                 # 在Anthropic API中，工具调用作为单独的内容块处理
                 for tool_call in tool_calls:
+                    # 工具调用可能来自两种格式：
+                    # 1. OpenAI 格式（从直接响应）：有 id, type, function
+                    # 2. 从流式响应提取的格式
+                    
+                    # 获取工具调用ID
+                    tool_use_id = tool_call.get("id")
+                    if not tool_use_id:
+                        tool_use_id = f"toolu_{uuid.uuid4().hex[:12]}"
+                    elif tool_use_id.startswith("call_"):
+                        # 转换 OpenAI 格式的 ID 为 Anthropic 格式
+                        tool_use_id = f"toolu_{tool_use_id[5:][:12]}"
+                    
                     # 确保工具调用有完整的信息
                     function_data = tool_call.get("function", {})
                     if "name" in function_data and "arguments" in function_data:
-                        # 生成唯一的工具调用ID以确保符合API规范
-                        tool_use_id = f"toolu_{uuid.uuid4().hex[:12]}"
                         try:
                             # 安全地解析参数
                             arguments = function_data.get("arguments", "{}")

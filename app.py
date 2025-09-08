@@ -265,6 +265,13 @@ if __name__ == "__main__":
     
     启动 Flask 应用服务器。
     """
+    # 设置控制台输出编码
+    import sys
+    if sys.platform.startswith('win'):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    
     # 免责声明
     print("\n" + "="*60)
     print("⚠️  免责声明：本项目仅供个人学习和研究使用")
