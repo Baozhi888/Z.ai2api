@@ -561,6 +561,17 @@ class AnthropicAPIHandler:
                 self.logger.info(f"  - Tool calls collected: {len(tool_calls)}")
                 self.logger.info(f"  - Final content preview: {repr(full_content[:200])}")
                 
+                # 尝试从流式内容中提取工具调用
+                tool_calls = []
+                if full_content and "tool_calls" in full_content:
+                    from tool_call_simple import SimpleToolCallHandler
+                    handler = SimpleToolCallHandler()
+                    extracted_calls = handler.extract_tool_calls(full_content)
+                    if extracted_calls:
+                        tool_calls = extracted_calls
+                        # 清理content中的JSON
+                        full_content = handler.strip_tool_json_from_text(full_content)
+                
                 # 即使没有文本内容，也可能有工具调用
                 if not full_content and not tool_calls:
                     self.logger.warning("No content or tool calls collected from stream")
@@ -585,9 +596,19 @@ class AnthropicAPIHandler:
                     full_content = message.get("content", "")
                     tool_calls = message.get("tool_calls", [])
                     
+                    # 如果没有直接的tool_calls但有content，尝试从 content 中提取
+                    if not tool_calls and full_content and "tool_calls" in full_content:
+                        from tool_call_simple import SimpleToolCallHandler
+                        handler = SimpleToolCallHandler()
+                        extracted_calls = handler.extract_tool_calls(full_content)
+                        if extracted_calls:
+                            tool_calls = extracted_calls
+                            # 清理content中的JSON
+                            full_content = handler.strip_tool_json_from_text(full_content)
+                    
                     self.logger.info(f"Direct response processing:")
-                    self.logger.info(f"  - Content length: {len(full_content) if full_content else 0}")
-                    self.logger.info(f"  - Tool calls: {len(tool_calls)}")
+                    self.logger.info(f"  - Content: {repr(full_content)}")
+                    self.logger.info(f"  - Tool calls: {tool_calls}")
                 else:
                     self.logger.error("Invalid response format from services")
                     return jsonify({
@@ -600,16 +621,26 @@ class AnthropicAPIHandler:
                         "usage": {"input_tokens": 0, "output_tokens": 0}
                     })
             
-            # 构建响应
+            # 构建响应 - Anthropic 格式需要先有文本再有工具调用
             response_content = []
-            if full_content:
+            
+            # 如果有工具调用但没有文本内容，添加默认文本
+            if tool_calls and (not full_content or not full_content.strip()):
+                # 根据工具名称生成适当的说明文本
+                tool_name = tool_calls[0].get("function", {}).get("name", "")
+                if "weather" in tool_name.lower():
+                    default_text = "我来帮您查询天气情况。"
+                else:
+                    default_text = f"我来使用 {tool_name} 工具帮您处理这个请求。"
+                response_content.append({"type": "text", "text": default_text})
+            elif full_content and full_content.strip():
                 response_content.append({"type": "text", "text": full_content})
             
             # 确保stop_reason正确设置
             stop_reason = "end_turn"
             if tool_calls:
                 stop_reason = "tool_use"
-            elif not full_content:
+            elif not response_content:
                 stop_reason = "error"
             
             response: AnthropicResponse = {
